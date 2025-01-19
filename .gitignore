@@ -2,3 +2,5 @@ venv/
 *.log
 *.pyc
 __pycache__/
+# Ignore vector_store.pkl
+vector_store.pkl
