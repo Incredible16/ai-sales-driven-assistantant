@@ -1,169 +1,204 @@
-import pyaudio
-import wave
-import whisper
-import pandas as pd
-import sqlite3
 import streamlit as st
+import os
+import wave
+import pyaudio
+import whisper
 from transformers import pipeline
-from datetime import datetime
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains import create_retrieval_chain
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 
-# --- Audio Parameters ---
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 44100
-RECORD_SECONDS = 5
+# Initialize session state variables
+if "whisper_model" not in st.session_state:
+    st.session_state.whisper_model = whisper.load_model("base", device="cpu")  # Whisper "base" model for accuracy
 
-# --- Whisper Model Loading ---
-model = whisper.load_model("base")
+if "sentiment_model" not in st.session_state:
+    st.session_state.sentiment_model = pipeline("sentiment-analysis", model="distilbert-base-uncased")
 
-# --- PyAudio Initialization ---
-audio = pyaudio.PyAudio()
+if "vectors" not in st.session_state:
+    st.session_state.vectors = None
 
-# --- Load Sentiment Analysis Model ---
-sentiment_analyzer = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+if "llm_model" not in st.session_state:
+    st.session_state.llm_model = ChatGroq(
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        model_name="Llama3-8b-8192"
+    )
 
-# --- Database Setup ---
-def setup_database():
-    """Creates the necessary SQLite tables if they do not exist."""
-    conn = sqlite3.connect('conversations.db')
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            sentiment TEXT,
-            summary TEXT,
-            customer_id TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS conversation_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER,
-            timestamp TEXT,
-            chunk_text TEXT,
-            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
-        )
-    """)
-    conn.commit()
-    conn.close()
+if "call_summaries" not in st.session_state:
+    st.session_state.call_summaries = []  # Store summaries of previous calls
 
-setup_database()
+# Function to record audio
+def record_audio(filename="output.wav", duration=5, rate=16000, chunk=1024):
+    """
+    Record audio using PyAudio and save it as a WAV file.
+    """
+    try:
+        audio = pyaudio.PyAudio()
+        stream = audio.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True, frames_per_buffer=chunk)
+        frames = []
 
-def record_audio():
-    """Records audio for the specified duration."""
-    stream = audio.open(format=FORMAT, channels=CHANNELS,
-                        rate=RATE, input=True,
-                        frames_per_buffer=CHUNK)
+        st.write(f"Recording for {duration} seconds...")
+        for _ in range(0, int(rate / chunk * duration)):
+            data = stream.read(chunk)
+            frames.append(data)
 
-    frames = []
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
 
-    for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-        data = stream.read(CHUNK)
-        frames.append(data)
+        with wave.open(filename, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(audio.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(rate)
+            wf.writeframes(b"".join(frames))
 
-    stream.stop_stream()
-    stream.close()
+        st.write(f"Audio saved to {filename}")
+    except Exception as e:
+        st.error(f"Error while recording audio: {e}")
 
-    return b''.join(frames)
+# Function to transcribe audio
+def transcribe_audio(filename="output.wav"):
+    """
+    Transcribe audio using Whisper and return the transcription text.
+    """
+    try:
+        model = st.session_state.whisper_model
+        result = model.transcribe(filename)
+        return result["text"]
+    except Exception as e:
+        st.error(f"Error during transcription: {e}")
+        return ""
 
-def analyze_sentiment(audio_data):
-    """Analyzes the sentiment of the recorded audio."""
-    with wave.open("temp.wav", 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(audio.get_sample_size(FORMAT))
-        wf.setframerate(RATE)
-        wf.writeframes(audio_data)
+# Perform sentiment analysis
+def analyze_sentiment(text):
+    """
+    Perform sentiment analysis on the given text.
+    """
+    try:
+        sentiment_result = st.session_state.sentiment_model(text[:500])  # Limit to 500 characters for speed
+        return sentiment_result[0]  # Return the first result
+    except Exception as e:
+        st.error(f"Error during sentiment analysis: {e}")
+        return {}
 
-    result = model.transcribe("temp.wav")
-    text = result["text"]
+# Function to process PDF and create FAISS vector embeddings
+def vector_embedding(pdf_path):
+    """
+    Embed PDF documents into FAISS for RAG-based retrieval.
+    """
+    try:
+        if not os.path.exists(pdf_path):
+            st.error(f"File not found: {pdf_path}")
+            return
 
-    # --- Sentiment Analysis using BERT ---
-    sentiment_result = sentiment_analyzer(text)
-    sentiment = sentiment_result[0]["label"]
+        if st.session_state.vectors is None:
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+            loader = PyPDFLoader(pdf_path)
+            docs = loader.load()
 
-    return sentiment, text
+            # Split the Document objects into smaller chunks
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=100)
+            final_documents = text_splitter.split_documents(docs)
 
-def detect_sentiment_shift(previous_sentiment, current_sentiment):
-    """Detects sentiment shifts."""
-    return previous_sentiment != current_sentiment
+            # Create FAISS vector store
+            st.session_state.vectors = FAISS.from_documents(final_documents, embeddings)
+            st.session_state.vectors.save_local("faiss_index")  # Save for reuse
 
-def store_chunk(conversation_id, timestamp, chunk_text):
-    """Stores individual chunks of a conversation in the database."""
-    conn = sqlite3.connect('conversations.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO conversation_chunks (conversation_id, timestamp, chunk_text) VALUES (?, ?, ?)",
-              (conversation_id, timestamp, chunk_text))
-    conn.commit()
-    conn.close()
+        st.success("Document embedding completed successfully!")
+    except Exception as e:
+        st.error(f"Error during embedding: {e}")
 
-def store_conversation_summary(timestamp, sentiment, summary, customer_id):
-    """Stores the summary of a conversation in the database."""
-    conn = sqlite3.connect('conversations.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO conversations (timestamp, sentiment, summary, customer_id) VALUES (?, ?, ?, ?)",
-              (timestamp, sentiment, summary, customer_id))
-    conn.commit()
-    conversation_id = c.lastrowid
-    conn.close()
-    return conversation_id
+# Load FAISS index
+def load_faiss_index():
+    """
+    Load the FAISS index from disk if not already in session state.
+    """
+    if st.session_state.vectors is None:
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+        st.session_state.vectors = FAISS.load_local("faiss_index", embeddings)
 
-def generate_conversation_summary(chunks):
-    """Generates a summary of the entire conversation."""
-    full_text = " ".join(chunks)
-    summary_prompt = f"Summarize the following conversation: {full_text}"
-    response = sentiment_analyzer(summary_prompt)
-    return response[0]["label"], full_text  # Replace with appropriate summary handling
+# Generate response using RAG
+def generate_response(input_text):
+    """
+    Generate a response using RAG (Retrieval-Augmented Generation).
+    """
+    try:
+        load_faiss_index()  # Ensure FAISS index is loaded
+        retriever = st.session_state.vectors.as_retriever(search_kwargs={"k": 5})  # Retrieve top 5 documents
+        llm = st.session_state.llm_model
 
-def main():
-    st.title("Real-time Speech Analysis")
+        # Combine retrieval and LLM into a chain
+        document_chain = create_stuff_documents_chain(llm, ChatPromptTemplate.from_template("{context}{input}"))
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
-    # --- Streamlit UI Elements ---
-    start_button = st.button("Start Recording")
-    stop_button = st.button("Stop Recording")
+        response = retrieval_chain.invoke({'input': input_text})
+        return response.get("answer", "No response generated.")
+    except Exception as e:
+        st.error(f"Error generating response: {e}")
+        return "No response generated."
 
-    # --- State Variables ---
-    if 'chunks' not in st.session_state:
-        st.session_state.chunks = []
+# Display the dashboard
+def display_dashboard():
+    """
+    Display the dashboard with summaries of all previously recorded calls.
+    """
+    st.subheader("Call Summary Dashboard")
 
-    if 'previous_sentiment' not in st.session_state:
-        st.session_state.previous_sentiment = "neutral"
+    # Show previous call summaries
+    st.markdown("### Previous Call Summaries")
+    if st.session_state.call_summaries:
+        for idx, summary in enumerate(st.session_state.call_summaries, start=1):
+            st.markdown(f"#### Call {idx}")
+            st.markdown(f"- **Transcription**: {summary['transcription']}")
+            st.markdown(f"- **Sentiment**: {summary['sentiment']['label']}")
+            st.markdown(f"- **Confidence**: {summary['sentiment']['score']:.2f}")
+            st.markdown(f"- **Generated Response**: {summary['response']}")
+            st.write("---")
+    else:
+        st.write("No call summaries available.")
 
-    if start_button:
-        st.write("Recording...")
+# Streamlit app with tabs for recording and dashboard
+st.title("Call Recording and RAG Summary Dashboard")
 
-        audio_data = record_audio()
+# Create tabs for recording and dashboard
+tab1, tab2 = st.tabs(["📞 Record a Call", "📊 Dashboard"])
 
-        current_sentiment, chunk_text = analyze_sentiment(audio_data)
-        st.session_state.chunks.append(chunk_text)
+# Tab 1: Record a call
+with tab1:
+    st.subheader("Record and Analyze a New Call")
+    duration = st.slider("Select Recording Duration (seconds)", min_value=5, max_value=60, value=10, step=5)
 
-        # Store chunk in database
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if 'conversation_id' not in st.session_state:
-            st.session_state.conversation_id = store_conversation_summary(timestamp, "neutral", "", "customer_001")
+    if st.button("Record and Analyze"):
+        # Record audio
+        audio_path = "output.wav"
+        record_audio(audio_path, duration=duration)  # Record audio for user-selected duration
 
-        store_chunk(st.session_state.conversation_id, timestamp, chunk_text)
+        # Transcribe audio
+        transcription = transcribe_audio(audio_path)
+        st.write("Transcribed Text:", transcription)
 
-        # Detect sentiment shift
-        if detect_sentiment_shift(st.session_state.previous_sentiment, current_sentiment):
-            st.success(f"Sentiment Shift Detected: {st.session_state.previous_sentiment} -> {current_sentiment}")
+        # Perform Sentiment Analysis
+        sentiment_result = analyze_sentiment(transcription)
+        st.write("Sentiment Analysis Result:", sentiment_result)
 
-        st.session_state.previous_sentiment = current_sentiment
+        # Generate response using RAG
+        response = generate_response(transcription)
+        st.write("Generated Response:", response)
 
-        st.write(f"Sentiment: {current_sentiment}")
-        st.write(f"Chunk Text: {chunk_text}")
+        # Save the summary
+        summary = {
+            "transcription": transcription,
+            "sentiment": sentiment_result,
+            "response": response
+        }
+        st.session_state.call_summaries.append(summary)
+        st.success("Call summary saved!")
 
-    if stop_button:
-        st.write("Recording stopped.")
-
-        # Generate and store conversation summary
-        sentiment, summary = generate_conversation_summary(st.session_state.chunks)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        store_conversation_summary(timestamp, sentiment, summary, "customer_001")
-
-        st.write("Summary of the conversation:")
-        st.write(summary)
-
-if __name__ == "__main__":
-    main()
+# Tab 2: Dashboard
+with tab2:
+    display_dashboard()
